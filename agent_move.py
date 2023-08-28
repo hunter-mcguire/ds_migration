@@ -1,15 +1,19 @@
 #!/usr/bin/python3
 
+import logging
+
 import requests
 from urllib3.exceptions import InsecureRequestWarning
+
+logging.basicConfig(level=logging.INFO)
 
 '''
 This script can be run via cmdline program or via import of AgentMove class.
 Below is an overview of what occurs throughout the script, execute_move being the entrypoint function.
-- get policy_id, display_name of supplied computerID/IDs :: get_ds_computer function
-- capture the policy/parent objects in case of needing to create in C1 :: get_ds_policy function
-- check Cloue One to see if policies exist and create if not :: policy_handler function
-- Use newly create policy and execute move_task :: create_move_task function
+- Get policy_id, display_name of supplied computerID/IDs via get_ds_computer function
+- Capture the policy/parent objects in case of needing to create in Cloud One via get_ds_policy function
+- Check Cloue One to see if policies exist and create if not via policy_handler function
+- Use newly create policy and execute move_task via create_move_task function
 '''
 
 class AgentMove:
@@ -49,8 +53,12 @@ class AgentMove:
             headers=self.ds_headers,
             verify=self.ds_ssl_verify
         ).json()
-
-        return response['policyID'], response['displayName']
+        
+        error = response.get('message')
+        if error:
+            return ('error', error)
+        else:
+            return response['policyID'], response['displayName']
     
     def get_ds_policy(self, policy_id: int) -> dict:
         '''
@@ -66,8 +74,8 @@ class AgentMove:
 
     def c1_policy_check(self, policy_name: str) -> int:
         '''
-        Function to check if policy_name exists in C1.
-        Returns True or False based on policy existence.
+        Function to check if policy_name exists in Cloud One.
+        Returns PolicyID or 0.
         '''
         search_response = requests.post(
                 url=f'{self.cloud_url}/policies/search',
@@ -88,7 +96,7 @@ class AgentMove:
         else:
             return 0
 
-    def create_c1_policy(self, agent_policy: dict):
+    def create_c1_policy(self, agent_policy: dict) -> int:
         '''
         Function to create C1 policy from existing DS policy.
         '''
@@ -123,55 +131,76 @@ class AgentMove:
         Function to handle policy dependancies. Ensuring parent/child policies
         exists prior to initiating move task
         '''
-        policy_exists = self.c1_policy_check(policy['name'])
+        policy_name = policy['name']
+        policy_exists = self.c1_policy_check(policy_name)
         if policy_exists:
-            print('C1 policy exits') # remove
+            if args.verbose:
+                logging.info(f'{policy_name} exists in Cloud One. Ready for move.')
             return policy_exists
         if parent_id:
             parent_policy = self.get_ds_policy(parent_id)
-            print('parent attached to policy, checking if in c1') # remove
-            c1_parent = self.c1_policy_check(parent_policy['name'])
+            parent_policy_name = parent_policy['name']
+            if args.verbose:
+                logging.info(f'Policy inherited from {parent_policy_name}, checking exists in Cloud One')
+            c1_parent = self.c1_policy_check(parent_policy_name)
             if c1_parent:
-                print('parent in c1') # remove
+                if args.verbose:
+                    logging.info(f'{parent_policy_name} exists in Cloud One. Proceeding..')
                 new_policy = policy
                 new_policy.pop('ID')
                 new_policy['parentID'] = c1_parent
                 c1_policy_id = self.create_c1_policy(new_policy)
                 if c1_policy_id:
-                    print('created and attached to parent') # remove
+                    if args.verbose:
+                        logging.info(f'{policy_name} created in Cloud One. Ready for move.')
                     return c1_policy_id
             else:
                 parent_policy.pop('ID')
-                print('not in c1, trying to create parent policy') # remove
+                if args.verbose:
+                    logging.info(f'Parent policy {parent_policy_name} not found in Cloud One.')
                 parent_id = self.create_c1_policy(parent_policy)
                 if parent_id:
-                    print('parent policy created, now creating main policy') # remove
+                    if args.verbose:
+                        logging.info(f'{parent_policy_name} parent policy created.')
                     new_policy = policy
                     new_policy.pop('ID')
                     new_policy['parentID'] = parent_id
                     c1_policy_id = self.create_c1_policy(new_policy)
                     if c1_policy_id:
-                        print('new policy created') # remove
+                        if args.verbose:
+                            logging.info(f'{policy_name} created in Cloud One. Ready for move.')
                         return c1_policy_id
         else:
-            print('no parent policy') # remove
-            print('checking if in c1') # remove
+            if args.verbose:
+                logging.info(f'Checking if {policy_name} in Cloud One')
             c1_policy_id = self.c1_policy_check(policy['name'])
             if not c1_policy_id:
-                print('no policy in c1, creating') # remove
+                if args.verbose:
+                    logging.info(f'Policy {policy_name} does not exist, creating..')
                 new_policy = policy
                 new_policy.pop('ID')
                 c1_policy_id = self.create_c1_policy(new_policy)
-
-            return c1_policy_id
+                if c1_policy_id:
+                    if args.verbose:
+                        logging.info(f'{policy_name} created in Cloud One. Ready for move.')
+                    return c1_policy_id
+        return 0
 
     def execute_move(self, computer_id: int) -> None:
         '''
-        Main Function that does the following via AgentMove class
+        Main entrypoint function:
+        - Gets computer info
+        - Handles policy dependancies
+        - Initiates move task 
         '''
         c1_policy_id = 0
         try:
-            agent_policy_id, agent_display_name = self.get_ds_computer(computer_id)
+            computer_info = self.get_ds_computer(computer_id)
+            if computer_info[0] == 'error':
+                logging.error(computer_info[1])
+                return
+            else:
+                agent_policy_id, agent_display_name = computer_info
             policy = self.get_ds_policy(agent_policy_id)
             parent_id = policy.get('parentID')
 
@@ -180,14 +209,20 @@ class AgentMove:
                 parent_id=parent_id if parent_id else 0
             )
         except Exception as error:
-            move_task = {'error': error}
+            move_error = error
 
         if c1_policy_id:
-            print('policy ready, executing move') # remove
+            if args.verbose:
+                logging.info(f'Creating Move Task: {agent_display_name}')
             try:
                 move_task = self.create_move_task(computer_id, c1_policy_id)
+                if args.verbose:
+                    logging.info(f"{agent_display_name} Move ID: {move_task['ID']}")
             except Exception as error:
-                move_task = {'error': error}
+                move_error = error
+        else:
+            if args.verbose:
+                logging.warning(f'Error: {move_error}')
 
 if __name__ == '__main__':
     '''
@@ -197,17 +232,22 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(
         prog='AgentMove',
-        description='Script to migrate DS Agent to C1'
+        description='Script to migrate Deep Security Agent to C1'
     )
 
     parser.add_argument('--ds_api_key', required=True)
     parser.add_argument('--ds_host', required=True)
     parser.add_argument('--ds_port', type=int, default=443, required=False)
-    parser.add_argument('--ds_ssl_ignore', action="store_false")
+    parser.add_argument('--ds_ssl_ignore', action="store_false",
+                        help='Disable TLS verification for DS self signed cert')
+    parser.add_argument('--verbose', action="store_true",
+                        help='Log output of script progress to console')
     parser.add_argument('--cloud_region', required=True)
     parser.add_argument('--cloud_api_key', required=True)
-    parser.add_argument('--computer_id', required=False)
-    parser.add_argument('--computer_ids', nargs='+', required=False)
+    parser.add_argument('--computer_id', required=False,
+                        help='Migrate single DS agent. ex --computer_id 34')
+    parser.add_argument('--computer_ids', nargs='+', required=False,
+                        help='Migrate multiple DS agents. 1+ IDs with space between. ex.  --computer_ids 32 33')
 
     args = parser.parse_args()
 
